@@ -21,7 +21,6 @@ import json
 import time
 import logging
 import requests
-import pandas as pd
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string, request
 
@@ -220,69 +219,89 @@ _binance = BinanceAPI()
 # 4. UT BOT LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_btc_data() -> pd.DataFrame:
+def _rolling_mean(values: list, period: int) -> list:
+    """Compute rolling mean without pandas."""
+    result = [None] * len(values)
+    for i in range(period - 1, len(values)):
+        result[i] = sum(values[i - period + 1 : i + 1]) / period
+    return result
+
+
+def fetch_btc_data() -> list[dict]:
+    """Returns list of OHLCV dicts. Empty list on failure."""
     raw = _binance.klines()
     if not raw:
-        return pd.DataFrame()
-    df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume","c","q","n","t","v","ignore"])
-    for col in ["open","high","low","close"]:
-        df[col] = df[col].astype(float)
-    return df
+        return []
+    candles = []
+    for r in raw:
+        candles.append({
+            "time":  int(r[0]),
+            "open":  float(r[1]),
+            "high":  float(r[2]),
+            "low":   float(r[3]),
+            "close": float(r[4]),
+        })
+    return candles
 
 
-def calc_utbot(df: pd.DataFrame, keyvalue: float, atr_period: int) -> pd.DataFrame:
-    df = df.copy()
-    df["tr"]  = df["high"] - df["low"]
-    df["atr"] = df["tr"].rolling(atr_period).mean()
-    nLoss = keyvalue * df["atr"]
+def calc_utbot(candles: list[dict], keyvalue: float, atr_period: int) -> dict:
+    """Returns {stops: [...], pos: [...]} parallel to candles list."""
+    n      = len(candles)
+    tr     = [c["high"] - c["low"] for c in candles]
+    atr    = _rolling_mean(tr, atr_period)
+    nLoss  = [keyvalue * (a if a is not None else 0) for a in atr]
 
-    stops, pos = [df["close"].iloc[0]], [0]
-    for i in range(1, len(df)):
+    stops  = [candles[0]["close"]]
+    pos    = [0]
+
+    for i in range(1, n):
         ps  = stops[-1]
-        src = df["close"].iloc[i]
-        s1  = df["close"].iloc[i-1]
+        src = candles[i]["close"]
+        s1  = candles[i-1]["close"]
+        nl  = nLoss[i]
         if src > ps and s1 > ps:
-            ns = max(ps, src - nLoss.iloc[i])
+            ns = max(ps, src - nl)
         elif src < ps and s1 < ps:
-            ns = min(ps, src + nLoss.iloc[i])
+            ns = min(ps, src + nl)
         else:
-            ns = src - nLoss.iloc[i] if src > ps else src + nLoss.iloc[i]
+            ns = src - nl if src > ps else src + nl
         stops.append(ns)
-        if s1 < ps and src > ps:   pos.append(1)
-        elif s1 > ps and src < ps: pos.append(-1)
-        else:                       pos.append(pos[-1])
+        if s1 < ps and src > ps:    pos.append(1)
+        elif s1 > ps and src < ps:  pos.append(-1)
+        else:                        pos.append(pos[-1])
 
-    df["stop"] = stops
-    df["pos"]  = pos
-    return df
+    return {"stops": stops, "pos": pos}
 
 
 def get_signal() -> dict:
-    df = fetch_btc_data()
-    if df.empty:
+    candles = fetch_btc_data()
+    if not candles:
         return {"signal": "No Data", "price": 0, "atr": 0, "utbot_stop": 0, "atr_avg": 0}
 
-    df1 = calc_utbot(df, 2, 1)
-    df2 = calc_utbot(df, 2, 300)
+    ut1 = calc_utbot(candles, 2, 1)
+    ut2 = calc_utbot(candles, 2, 300)
 
-    price    = float(df["close"].iloc[-1])
-    sig1     = df1["pos"].iloc[-1]
-    sig2     = df2["pos"].iloc[-1]
-    stop1    = float(df1["stop"].iloc[-1])
-    stop2    = float(df2["stop"].iloc[-1])
+    price  = candles[-1]["close"]
+    sig1   = ut1["pos"][-1]
+    sig2   = ut2["pos"][-1]
+    stop1  = ut1["stops"][-1]
+    stop2  = ut2["stops"][-1]
 
-    # Stable ATR for risk calcs
-    cfg      = load_config()
-    period   = cfg["cooldown"]["atr_avg_period"]
-    df["tr_s"] = df["high"] - df["low"]
-    df["atr_s"]= df["tr_s"].rolling(14).mean()
-    atr_now  = float(df["atr_s"].iloc[-1]) if not df["atr_s"].isna().all() else 0.0
-    atr_avg  = float(df["atr_s"].rolling(period).mean().iloc[-1]) if not df["atr_s"].isna().all() else atr_now
+    # Stable ATR (14-period) and rolling avg for cooldown calc
+    cfg    = load_config()
+    period = cfg["cooldown"]["atr_avg_period"]
+    tr14   = [c["high"] - c["low"] for c in candles]
+    atr14  = _rolling_mean(tr14, 14)
+    atr_now = next((v for v in reversed(atr14) if v is not None), 0.0)
+
+    # Rolling mean of atr14 over  candles (skip Nones)
+    valid_atrs = [v for v in atr14 if v is not None]
+    atr_avg = sum(valid_atrs[-period:]) / min(period, len(valid_atrs)) if valid_atrs else atr_now
 
     signal, utbot_stop = "Hold", price
     if sig2 == 1:
         signal, utbot_stop = "Buy", stop2
-    if sig1 == -1:                        # Sell overrides Buy (fast signal wins)
+    if sig1 == -1:
         signal, utbot_stop = "Sell", stop1
 
     return {"signal": signal, "price": price, "atr": atr_now, "utbot_stop": utbot_stop, "atr_avg": atr_avg}
