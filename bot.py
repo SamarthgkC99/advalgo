@@ -24,14 +24,32 @@ import requests
 import pandas as pd
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string, request
-from dotenv import load_dotenv
-
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# =============================================================================
+# ENVIRONMENT / DEPLOYMENT VARIABLES — edit here before deploying
+# =============================================================================
+
+ENV = {
+    # Port — Render injects PORT automatically, fallback to 5000 locally
+    "PORT": int(os.environ.get("PORT", 5000)),
+
+    # Default lot size in BTC (overridable from dashboard too)
+    "LOT_SIZE_BTC": float(os.environ.get("LOT_SIZE_BTC", 0.001)),
+
+    # Manual USDT/INR rate fallback (used if auto-fetch fails)
+    "USDT_INR_MANUAL": float(os.environ.get("USDT_INR_MANUAL", 85.0)),
+
+    # Set to "false" to disable auto USDT/INR fetching from internet
+    "USDT_INR_AUTO_FETCH": os.environ.get("USDT_INR_AUTO_FETCH", "true").lower() == "true",
+
+    # Starting demo balance in INR
+    "START_BALANCE_INR": float(os.environ.get("START_BALANCE_INR", 10000.0)),
+}
 
 # ── File paths ──────────────────────────────────────────────────────────────
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -43,13 +61,13 @@ DEFAULT_CONFIG = {
     # ── Lot size ──────────────────────────────────────────────────
     "lot_size": {
         "mode": "manual",          # "manual" only (future: "auto")
-        "btc_amount": 0.001        # BTC per trade — edit freely
+        "btc_amount": ENV["LOT_SIZE_BTC"]
     },
 
     # ── USDT/INR rate ─────────────────────────────────────────────
     "usdt_inr": {
-        "auto_fetch": True,        # try internet first
-        "manual_rate": 85.0,       # fallback if fetch fails
+        "auto_fetch":  ENV["USDT_INR_AUTO_FETCH"],
+        "manual_rate": ENV["USDT_INR_MANUAL"]
         "cache_seconds": 300       # re-fetch every 5 min
     },
 
@@ -89,7 +107,7 @@ DEFAULT_CONFIG = {
 
     # ── Account protection ────────────────────────────────────────
     "account": {
-        "start_balance_inr": 10000.0,
+        "start_balance_inr": ENV["START_BALANCE_INR"],
         "min_balance_inr": 5000.0,
         "max_drawdown_pct": 20.0
     }
@@ -1015,5 +1033,5 @@ if __name__ == "__main__":
     print(f"📡 Signal    : http://localhost:5000/signal")
     print(f"⚙️  Config    : http://localhost:5000/config")
     print("="*60)
-    port = int(os.getenv("PORT", 5000))
+    port = ENV["PORT"]
     app.run(host="0.0.0.0", port=port, debug=False)
